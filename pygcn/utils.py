@@ -1,6 +1,34 @@
+from time import perf_counter
+
 import numpy as np
 import scipy.sparse as sp
 import torch
+from sklearn.metrics import f1_score
+
+
+def aug_normalized_adjacency(adj):
+    adj = adj + sp.eye(adj.shape[0])
+    adj = sp.coo_matrix(adj)
+    row_sum = np.array(adj.sum(1))
+    d_inv_sqrt = np.power(row_sum, -0.5).flatten()
+    d_inv_sqrt[np.isinf(d_inv_sqrt)] = 0.
+    d_mat_inv_sqrt = sp.diags(d_inv_sqrt)
+    return d_mat_inv_sqrt.dot(adj).dot(d_mat_inv_sqrt).tocoo()
+
+
+def fetch_normalization(type):
+    switcher = {
+        'AugNormAdj': aug_normalized_adjacency,  # A' = (D + I)^-1/2 * ( A + I ) * (D + I)^-1/2
+    }
+    func = switcher.get(type, lambda: "Invalid normalization technique.")
+    return func
+
+
+def parse_index_file(filename):
+    index = []
+    for line in open(filename):
+        index.append(int(line.strip()))
+    return index
 
 
 def encode_onehot(labels):
@@ -10,47 +38,6 @@ def encode_onehot(labels):
     labels_onehot = np.array(list(map(classes_dict.get, labels)),
                              dtype=np.int32)
     return labels_onehot
-
-
-def load_data(path="../data/cora/", dataset="cora"):
-    """Load citation network dataset (cora only for now)"""
-    print('Loading {} dataset...'.format(dataset))
-
-    idx_features_labels = np.genfromtxt("{}{}.content".format(path, dataset),
-                                        dtype=np.dtype(str))
-    features = sp.csr_matrix(idx_features_labels[:, 1:-1], dtype=np.float32)
-    labels = encode_onehot(idx_features_labels[:, -1])
-
-    # build graph
-    idx = np.array(idx_features_labels[:, 0], dtype=np.int32)
-    idx_map = {j: i for i, j in enumerate(idx)}
-    edges_unordered = np.genfromtxt("{}{}.cites".format(path, dataset),
-                                    dtype=np.int32)
-    edges = np.array(list(map(idx_map.get, edges_unordered.flatten())),
-                     dtype=np.int32).reshape(edges_unordered.shape)
-    adj = sp.coo_matrix((np.ones(edges.shape[0]), (edges[:, 0], edges[:, 1])),
-                        shape=(labels.shape[0], labels.shape[0]),
-                        dtype=np.float32)
-
-    # build symmetric adjacency matrix
-    adj = adj + adj.T.multiply(adj.T > adj) - adj.multiply(adj.T > adj)
-
-    features = normalize(features)
-    adj = normalize(adj + sp.eye(adj.shape[0]))
-
-    idx_train = range(140)
-    idx_val = range(200, 500)
-    idx_test = range(500, 1500)
-
-    features = torch.FloatTensor(np.array(features.todense()))
-    labels = torch.LongTensor(np.where(labels)[1])
-    adj = sparse_mx_to_torch_sparse_tensor(adj)
-
-    idx_train = torch.LongTensor(idx_train)
-    idx_val = torch.LongTensor(idx_val)
-    idx_test = torch.LongTensor(idx_test)
-
-    return adj, features, labels, idx_train, idx_val, idx_test
 
 
 def normalize(mx):
@@ -63,11 +50,50 @@ def normalize(mx):
     return mx
 
 
+def row_normalize(mx):
+    """Row-normalize sparse matrix"""
+    return normalize(mx)
+
+
+def normalize_adj(mx):
+    return normalize(mx).tocoo()
+
+
+def laplacian(mx, norm):
+    """Laplacian-normalize sparse matrix"""
+    assert (all(len(row) == len(mx) for row in mx)), \
+        "Input should be a square matrix"
+    return sp.csgraph.laplacian(mx, normed=norm)
+
+
 def accuracy(output, labels):
     preds = output.max(1)[1].type_as(labels)
     correct = preds.eq(labels).double()
     correct = correct.sum()
     return correct / len(labels)
+
+
+def f1(output, labels):
+    preds = output.max(1)[1]
+    preds = preds.cpu().detach().numpy()
+    labels = labels.cpu().detach().numpy()
+    micro = f1_score(labels, preds, average='micro')
+    macro = f1_score(labels, preds, average='macro')
+    return micro, macro
+
+
+def sgc_precompute(features, adj, degree):
+    t = perf_counter()
+    for i in range(degree):
+        features = torch.spmm(adj, features)
+    precompute_time = perf_counter() - t
+    return features, precompute_time
+
+
+def set_seed(seed, cuda):
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+    if cuda: torch.cuda.manual_seed(seed)
 
 
 def sparse_mx_to_torch_sparse_tensor(sparse_mx):
@@ -78,3 +104,4 @@ def sparse_mx_to_torch_sparse_tensor(sparse_mx):
     values = torch.from_numpy(sparse_mx.data)
     shape = torch.Size(sparse_mx.shape)
     return torch.sparse.FloatTensor(indices, values, shape)
+
